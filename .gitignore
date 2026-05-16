@@ -1,5 +1,6 @@
 # Claude Code local settings (machine-specific, CLAUDE.md is intentionally committed)
 .claude/
+CLAUDE.md
 
 # Python
 consumer/.venv/
