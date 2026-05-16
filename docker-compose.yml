@@ -1,0 +1,147 @@
+networks:
+  cdc-net:
+    driver: bridge
+
+services:
+
+  # ─── SQL SERVER ──────────────────────────────────────────────────────────────
+  # Developer edition is free and fully supports CDC.
+  # MSSQL_AGENT_ENABLED is mandatory: CDC uses SQL Agent capture jobs internally.
+  sqlserver:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    container_name: sqlserver
+    hostname: sqlserver
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_SA_PASSWORD: "YourStrong!Passw0rd"
+      MSSQL_PID: "Developer"
+      MSSQL_AGENT_ENABLED: "true"
+    ports:
+      - "1433:1433"
+    healthcheck:
+      test: >
+        /opt/mssql-tools18/bin/sqlcmd
+        -S localhost -U sa -P "YourStrong!Passw0rd"
+        -No -Q "SELECT 1" || exit 1
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+    networks:
+      - cdc-net
+
+  # ─── SQL SERVER INIT (one-shot) ───────────────────────────────────────────────
+  # The mssql/server image has no entrypoint hook for .sql files (unlike Postgres).
+  # This sidecar runs init.sql once after sqlserver is healthy, then exits 0.
+  sqlserver-init:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    container_name: sqlserver-init
+    depends_on:
+      sqlserver:
+        condition: service_healthy
+    environment:
+      MSSQL_SA_PASSWORD: "YourStrong!Passw0rd"
+    # Override the image's entrypoint (launch_sqlservr.sh) so we can run sqlcmd directly.
+    entrypoint: ["/bin/bash"]
+    command:
+      - "-c"
+      - >-
+        /opt/mssql-tools18/bin/sqlcmd
+        -S sqlserver -U sa -P 'YourStrong!Passw0rd'
+        -No -i /init.sql
+        && echo 'Init script completed successfully'
+    volumes:
+      - ./sqlserver/init.sql:/init.sql:ro
+    networks:
+      - cdc-net
+    restart: "no"
+
+  # ─── ZOOKEEPER ───────────────────────────────────────────────────────────────
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.1
+    container_name: zookeeper
+    hostname: zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+    healthcheck:
+      test: ["CMD-SHELL", "echo srvr | nc -w 2 localhost 2181 | grep -q Mode"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - cdc-net
+
+  # ─── KAFKA ───────────────────────────────────────────────────────────────────
+  # Two listeners:
+  #   PLAINTEXT      → container-to-container (kafka:29092)
+  #   PLAINTEXT_HOST → host machine access   (localhost:9092)
+  kafka:
+    image: confluentinc/cp-kafka:7.6.1
+    container_name: kafka
+    hostname: kafka
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: "zookeeper:2181"
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT"
+      KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092"
+      KAFKA_LISTENERS: "PLAINTEXT://0.0.0.0:29092,PLAINTEXT_HOST://0.0.0.0:9092"
+      KAFKA_INTER_BROKER_LISTENER_NAME: "PLAINTEXT"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_LOG_RETENTION_HOURS: 168
+    ports:
+      - "9092:9092"
+      - "29092:29092"
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:29092"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    networks:
+      - cdc-net
+
+# ─── KAFKA CONNECT + DEBEZIUM ─────────────────────────────────────────────────
+  # quay.io/debezium/connect ships all Debezium connectors pre-installed.
+  # Waits for kafka (healthy) AND sqlserver-init (completed) before starting.
+  kafka-connect:
+    image: quay.io/debezium/connect:3.0.0.Final
+    container_name: kafka-connect
+    hostname: kafka-connect
+    depends_on:
+      kafka:
+        condition: service_healthy
+      sqlserver-init:
+        condition: service_completed_successfully
+    environment:
+      BOOTSTRAP_SERVERS: "kafka:29092"
+      GROUP_ID: "cdc-connect-group"
+      CONFIG_STORAGE_TOPIC: "connect-configs"
+      OFFSET_STORAGE_TOPIC: "connect-offsets"
+      STATUS_STORAGE_TOPIC: "connect-status"
+      CONFIG_STORAGE_REPLICATION_FACTOR: 1
+      OFFSET_STORAGE_REPLICATION_FACTOR: 1
+      STATUS_STORAGE_REPLICATION_FACTOR: 1
+      # JSON converter with schemas stripped → clean payload for the Python consumer
+      KEY_CONVERTER: "org.apache.kafka.connect.json.JsonConverter"
+      VALUE_CONVERTER: "org.apache.kafka.connect.json.JsonConverter"
+      KEY_CONVERTER_SCHEMAS_ENABLE: "false"
+      VALUE_CONVERTER_SCHEMAS_ENABLE: "false"
+    ports:
+      - "8083:8083"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8083/connectors"]
+      interval: 15s
+      timeout: 10s
+      retries: 15
+      start_period: 45s
+    networks:
+      - cdc-net

@@ -1,0 +1,90 @@
+{
+  // Unique name for this connector instance in Kafka Connect.
+  // Used in REST API paths: /connectors/<name>/status
+  "name": "sqlserver-cdc-connector",
+
+  "config": {
+    // The Debezium connector class for SQL Server.
+    // Other available connectors: MySQL, PostgreSQL, MongoDB, Oracle, Db2.
+    "connector.class": "io.debezium.connector.sqlserver.SqlServerConnector",
+
+    // Always 1 for SQL Server — the connector does not support parallel tasks per database.
+    "tasks.max": "1",
+
+    // ── TOPIC NAMING ────────────────────────────────────────────────────────────
+    // All topics produced by this connector are named:
+    //   <topic.prefix>.<database>.<schema>.<table>
+    // For this config: cdc.CdcDemo.dbo.customers
+    "topic.prefix": "cdc",
+
+    // ── DATABASE CONNECTION ──────────────────────────────────────────────────────
+    // Use the Docker service name as hostname — Debezium runs inside the same network.
+    "database.hostname": "sqlserver",
+    "database.port": "1433",
+    "database.user": "sa",
+    "database.password": "YourStrong!Passw0rd",
+
+    // Comma-separated list of databases to monitor.
+    // Each database produces its own set of topics.
+    "database.names": "CdcDemo",
+
+    // SQL Server in Docker uses a self-signed TLS certificate.
+    // The Microsoft JDBC driver enforces cert validation by default in recent versions,
+    // so without these two properties the connector fails with an SSL handshake error.
+    // In production (RDS, Azure SQL) remove these and use proper certs.
+    "database.encrypt": "false",
+    "database.trustServerCertificate": "true",
+
+    // ── WHAT TO CAPTURE ─────────────────────────────────────────────────────────
+    // Format: <schema>.<table>  (the database is already given by database.names above).
+    // Despite what some docs say, the SQL Server connector matches this against the
+    // CDC change tables using schema.table — NOT database.schema.table.
+    // Comma-separated for multiple tables.
+    // Alternatives:
+    //   "table.exclude.list"   — capture everything except these tables
+    //   "column.include.list"  — capture only specific columns (useful for PII masking)
+    //   "column.exclude.list"  — exclude specific columns from the payload
+    "table.include.list": "dbo.customers",
+
+    // ── SCHEMA HISTORY ──────────────────────────────────────────────────────────
+    // Debezium stores every DDL change (ALTER TABLE, etc.) in this internal Kafka topic.
+    // On restart, it replays this history to reconstruct the correct schema for each LSN.
+    // Do NOT consume from this topic — it is internal to the connector.
+    "schema.history.internal.kafka.bootstrap.servers": "kafka:29092",
+    "schema.history.internal.kafka.topic": "schema-changes.CdcDemo",
+
+    // ── SERIALIZATION ───────────────────────────────────────────────────────────
+    // JsonConverter: messages are plain JSON — easy to read and no extra dependencies.
+    //
+    // Alternative: io.confluent.kafka.serializers.KafkaAvroSerializer (Avro)
+    //   — compact binary encoding, schema enforced via Schema Registry
+    //   — used in production; requires adding "schema.registry.url" property
+    //
+    // schemas.enable=false strips the verbose Kafka Connect schema envelope,
+    // so the message value IS the payload directly:
+    //   { "op": "u", "before": {...}, "after": {...}, "source": {...}, "ts_ms": ... }
+    //
+    // schemas.enable=true wraps it in a { "schema": {...}, "payload": {...} } envelope,
+    // which is useful for Kafka Connect sink connectors but noisy for manual exploration.
+    "key.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "key.converter.schemas.enable": "false",
+    "value.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "value.converter.schemas.enable": "false",
+
+    // Emit a dedicated event to the topic when the table schema changes (DDL).
+    // Useful for tracking ALTER TABLE statements over time.
+    "include.schema.changes": "true",
+
+    // ── SNAPSHOT MODE ───────────────────────────────────────────────────────────
+    // Controls what happens the very first time the connector starts (no saved offset).
+    //
+    //   "initial"      — reads all existing rows as "r" (read) events, then streams the log.
+    //                    Re-registering the connector after deleting it will re-snapshot.
+    //   "initial_only" — snapshot only, then stop. No ongoing streaming.
+    //   "schema_only"  — captures table structure but skips existing rows; streams from now.
+    //                    Use this when you only care about future changes, not history.
+    //   "never"        — skip snapshot, stream from the current LSN position.
+    //   "when_needed"  — only snapshots if offsets are missing or the LSN is no longer in the log.
+    "snapshot.mode": "initial"
+  }
+}

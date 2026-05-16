@@ -1,0 +1,18 @@
+# Claude Code local settings (machine-specific, CLAUDE.md is intentionally committed)
+.claude/
+
+# Python
+consumer/.venv/
+__pycache__/
+*.pyc
+
+# Environment
+.env
+
+# IDEs
+.vs/
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
