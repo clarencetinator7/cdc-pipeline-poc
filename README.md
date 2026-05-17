@@ -13,20 +13,24 @@ A fully containerized CDC (Change Data Capture) pipeline for local exploration, 
 SQL Server (CDC enabled on dbo.customers)
         │  T-Log polling via JDBC
         ▼
-Kafka Connect + Debezium SQL Server Connector
-        │  JSON messages, topic: cdc.CdcDemo.dbo.customers
-        ▼
-Kafka PRIMARY (KRaft, :9092)
-        │
-        ├── consumer.py  ─  pretty-prints op / before / after / changed fields
-        │
-        └── MirrorMaker 2  ──────────────────────────────────────────────────┐
-              replicates: CDC topic + connect-offsets + schema-changes        │
-                                                                              ▼
-                                                                    Kafka DR (KRaft, :9093)
-                                                                              │
-                                                               consumer.py  (on failover)
+┌─────────────────────────┐       ┌─────────────────────────┐
+│  kafka-connect          │       │  kafka-connect-dr        │
+│  Debezium  [RUNNING]    │       │  Debezium  [PAUSED]      │
+│  → writes to primary    │       │  → writes to DR          │
+│  port 8083              │       │  port 8084               │
+└──────────┬──────────────┘       └──────────┬───────────────┘
+           │                                 │
+           ▼                                 ▼
+   Kafka PRIMARY (KRaft)  ◄──MM2──►  Kafka DR (KRaft)
+        :9092                              :9093
+           │                                 │
+           └──────────┬──────────────────────┘
+                      ▼
+                consumer.py
+          (points at whichever cluster is active)
 ```
+
+On failover: `resume` the DR connector (one API call). On failback: `pause` DR, `resume` primary.
 
 ### Service Map
 
@@ -36,9 +40,10 @@ Kafka PRIMARY (KRaft, :9092)
 | Kafka (primary, KRaft) | `confluentinc/cp-kafka:7.6.1` | 9092 (host), 29092 (internal) |
 | Kafka DR (KRaft) | `confluentinc/cp-kafka:7.6.1` | 9093 (host), 29093 (internal) |
 | MirrorMaker 2 | `confluentinc/cp-kafka:7.6.1` | — |
-| Kafka Connect + Debezium | `quay.io/debezium/connect:3.0.0.Final` | 8083 |
+| Kafka Connect (primary) | `quay.io/debezium/connect:3.0.0.Final` | 8083 |
+| Kafka Connect (DR) | `quay.io/debezium/connect:3.0.0.Final` | 8084 |
 
-Both Kafka clusters run in **KRaft mode** — no ZooKeeper required. Each broker is its own controller.
+Both Kafka clusters run in **KRaft mode** — no ZooKeeper required.
 
 ---
 
@@ -64,9 +69,10 @@ Startup order enforced by health checks:
 sqlserver (healthy)
     └── sqlserver-init  →  runs init.sql, exits 0
 kafka (KRaft, healthy)
-    ├── kafka-connect   ←  waits for kafka AND sqlserver-init
-    └── mirrormaker2    ←  waits for kafka AND kafka-dr
+    ├── kafka-connect       ←  waits for kafka AND sqlserver-init
+    └── mirrormaker2        ←  waits for kafka AND kafka-dr
 kafka-dr (KRaft, healthy)
+    ├── kafka-connect-dr    ←  waits for kafka-dr AND sqlserver-init
     └── mirrormaker2
 ```
 
@@ -78,25 +84,22 @@ docker compose ps
 
 Expected: all long-running services show `(healthy)`, `sqlserver-init` shows `Exited (0)`.
 
-### 3. Register the Debezium connector
+### 3. Register the Debezium connectors
 
 ```powershell
+# Primary connector — RUNNING, writes to kafka:29092
 .\scripts\register_connector.ps1
+
+# DR connector — registered then immediately PAUSED, ready for failover
+.\scripts\register_connector_dr.ps1
 ```
 
-Or from WSL/Git Bash:
-
-```bash
-bash scripts/register_connector.sh
-```
-
-### 4. Confirm the connector is running
+### 4. Confirm connector states
 
 ```powershell
-Invoke-RestMethod http://localhost:8083/connectors/sqlserver-cdc-connector/status
+Invoke-RestMethod http://localhost:8083/connectors/sqlserver-cdc-connector/status  # state: RUNNING
+Invoke-RestMethod http://localhost:8084/connectors/sqlserver-cdc-connector/status  # state: PAUSED
 ```
-
-`state` should be `RUNNING`.
 
 ### 5. Run the Python consumer
 
@@ -147,7 +150,7 @@ Then paste statements from `sqlserver/debug.sql` — it has sections for INSERT,
 
 Operation codes: `r` = snapshot read, `c` = insert, `u` = update, `d` = delete.
 
-The consumer reads from `KAFKA_BOOTSTRAP_SERVERS` and `KAFKA_TOPIC` environment variables (defaulting to the primary cluster). This allows switching to DR without code changes.
+The consumer reads `KAFKA_BOOTSTRAP_SERVERS` (default `localhost:9092`) from the environment — switch it to `localhost:9093` to point at DR without code changes.
 
 ---
 
@@ -155,17 +158,27 @@ The consumer reads from `KAFKA_BOOTSTRAP_SERVERS` and `KAFKA_TOPIC` environment 
 
 ### How it works
 
-MirrorMaker 2 (MM2) continuously replicates three topics from the primary Kafka to the DR Kafka:
+MirrorMaker 2 runs bidirectional replication between both clusters. Each direction replicates:
 
 | Topic | Why it's needed |
 |---|---|
 | `cdc.CdcDemo.dbo.customers` | The CDC event data itself |
-| `connect-offsets` | Debezium's last-committed SQL Server LSN — lets it resume from the exact position after failover |
+| `connect-offsets` | Debezium's last-committed SQL Server LSN — lets it resume from the exact position on either cluster |
 | `schema-changes.CdcDemo` | Debezium's DDL history — needed to reconstruct table schemas at every LSN on restart |
 
-`IdentityReplicationPolicy` is used so topic names are **identical** on both clusters. Neither the consumer nor kafka-connect need different config on failover.
+`IdentityReplicationPolicy` keeps topic names identical on both clusters — neither the consumer nor kafka-connect needs different config on failover.
 
-> **Note:** This mirrors how AWS MSK Replication works — it is managed MirrorMaker 2 under the hood. Running MM2 yourself on EC2/ECS against MSK clusters is the self-hosted equivalent and uses the same configuration.
+MM2's **circular replication protection** stamps every replicated message with a `__mm2_source_cluster_alias` header. A message that originated on primary and was copied to DR will not be sent back to primary — MM2 skips it automatically.
+
+> **Production note:** AWS MSK Replication is managed MirrorMaker 2 under the hood. The active-passive Debezium pattern (one connector running, one paused) is the standard approach for multi-region Kafka Connect DR.
+
+### Normal state
+
+```
+kafka-connect      → Debezium RUNNING  → writes to primary Kafka
+kafka-connect-dr   → Debezium PAUSED   → ready, not writing
+MM2                → primary ↔ DR      → continuous bidirectional sync
+```
 
 ### Verify replication is active
 
@@ -174,87 +187,37 @@ docker exec kafka-dr kafka-topics --bootstrap-server localhost:29093 --list
 # expect: cdc.CdcDemo.dbo.customers, connect-offsets, schema-changes.CdcDemo
 ```
 
-### Simulating a disaster
+### Failover (primary Kafka goes down)
 
 ```powershell
+# Simulate disaster
 docker stop kafka
-```
 
-The primary Kafka is down. The consumer will error and exit. New SQL Server changes continue accumulating in the CDC change tables — SQL Agent doesn't care that Kafka is down.
+# One command — resumes the pre-registered DR connector.
+# Debezium reads the replicated LSN from connect-offsets on kafka-dr and picks up
+# exactly where the primary connector left off. No snapshot, no gap.
+.\scripts\failover_to_dr.ps1
 
-### Manual failover — step by step
-
-**Step 1 — Switch kafka-connect to the DR cluster:**
-
-```powershell
-$env:KAFKA_CONNECT_BOOTSTRAP = "kafka-dr:29093"
-docker compose up -d kafka-connect
-```
-
-**Step 2 — Wait for kafka-connect to be healthy:**
-
-```powershell
-Invoke-RestMethod http://localhost:8083/connectors
-# returns [] once ready
-```
-
-**Step 3 — Re-register the Debezium connector pointing schema history at DR:**
-
-The only change from the original config is `schema.history.internal.kafka.bootstrap.servers` → `kafka-dr:29093`. Debezium will find its last LSN in the replicated `connect-offsets` topic and resume CDC from that position — no re-snapshot.
-
-```powershell
-$body = @{
-  name = "sqlserver-cdc-connector"
-  config = @{
-    "connector.class"                                    = "io.debezium.connector.sqlserver.SqlServerConnector"
-    "tasks.max"                                          = "1"
-    "topic.prefix"                                       = "cdc"
-    "database.hostname"                                  = "sqlserver"
-    "database.port"                                      = "1433"
-    "database.user"                                      = "sa"
-    "database.password"                                  = "YourStrong!Passw0rd"
-    "database.names"                                     = "CdcDemo"
-    "database.encrypt"                                   = "false"
-    "database.trustServerCertificate"                    = "true"
-    "table.include.list"                                 = "dbo.customers"
-    "schema.history.internal.kafka.bootstrap.servers"    = "kafka-dr:29093"
-    "schema.history.internal.kafka.topic"                = "schema-changes.CdcDemo"
-    "key.converter"                                      = "org.apache.kafka.connect.json.JsonConverter"
-    "key.converter.schemas.enable"                       = "false"
-    "value.converter"                                    = "org.apache.kafka.connect.json.JsonConverter"
-    "value.converter.schemas.enable"                     = "false"
-    "include.schema.changes"                             = "true"
-    "snapshot.mode"                                      = "initial"
-  }
-} | ConvertTo-Json -Depth 5
-
-Invoke-RestMethod -Method Post -Uri http://localhost:8083/connectors `
-  -ContentType "application/json" -Body $body
-```
-
-**Step 4 — Confirm Debezium resumed (no snapshot):**
-
-```powershell
-Invoke-RestMethod http://localhost:8083/connectors/sqlserver-cdc-connector/status
-# state: RUNNING — consumer should NOT see new SNAPSHOT READ events
-```
-
-**Step 5 — Switch consumer to DR:**
-
-```powershell
+# Switch consumer to DR
 $env:KAFKA_BOOTSTRAP_SERVERS = "localhost:9093"
 python consumer/consumer.py
 ```
 
-New SQL Server changes now flow through the DR cluster end-to-end.
-
-### Automated failover
-
-The script `scripts/failover_to_dr.ps1` runs all five steps above automatically:
+### Failback (primary Kafka restored)
 
 ```powershell
-.\scripts\failover_to_dr.ps1
+# Bring primary back
+docker start kafka
+
+# Waits for MM2 dr->primary replication to catch up, then swaps the active connector.
+.\scripts\failback_to_primary.ps1
+
+# Switch consumer back to primary
+$env:KAFKA_BOOTSTRAP_SERVERS = "localhost:9092"
+python consumer/consumer.py
 ```
+
+The failback script polls end offsets on both clusters and only swaps connectors once primary has all DR events — preventing any gap.
 
 ---
 
@@ -262,49 +225,51 @@ The script `scripts/failover_to_dr.ps1` runs all five steps above automatically:
 
 ```
 poc-cdc-pipeline/
-├── docker-compose.yml              # All services with health checks (KRaft, no ZooKeeper)
+├── docker-compose.yml                # All services (KRaft, no ZooKeeper)
 ├── sqlserver/
-│   ├── init.sql                    # Creates CdcDemo, enables CDC, seeds 3 rows
-│   └── debug.sql                   # INSERT / UPDATE / DELETE / RESET statements for testing
+│   ├── init.sql                      # Creates CdcDemo, enables CDC, seeds 3 rows
+│   └── debug.sql                     # INSERT / UPDATE / DELETE / RESET for testing
 ├── connect/
-│   ├── connector.jsonc             # Debezium connector config (commented)
-│   └── mm2.properties              # MirrorMaker 2 replication config
+│   ├── connector.jsonc               # Primary Debezium connector config
+│   ├── connector-dr.jsonc            # DR Debezium connector config (schema history → kafka-dr)
+│   └── mm2.properties                # MirrorMaker 2 bidirectional replication config
 ├── scripts/
-│   ├── register_connector.ps1      # POST connector config (PowerShell)
-│   ├── register_connector.sh       # POST connector config (Bash/WSL)
-│   └── failover_to_dr.ps1          # Full DR failover automation (PowerShell)
+│   ├── register_connector.ps1        # Register primary connector (PowerShell)
+│   ├── register_connector.sh         # Register primary connector (Bash/WSL)
+│   ├── register_connector_dr.ps1     # Register DR connector and immediately pause it
+│   ├── failover_to_dr.ps1            # Resume DR connector (one API call)
+│   └── failback_to_primary.ps1       # Wait for MM2 sync, swap connectors back
 └── consumer/
-    ├── consumer.py                 # CDC event pretty-printer (env-var configurable)
-    └── requirements.txt            # confluent-kafka==2.4.0
+    ├── consumer.py                   # CDC event pretty-printer (env-var configurable)
+    └── requirements.txt              # confluent-kafka==2.4.0
 ```
 
 ---
 
 ## Connector Configuration
 
-The connector config lives in [connect/connector.jsonc](connect/connector.jsonc) in JSONC format (JSON with `//` comments). The registration scripts strip comments before POSTing to the Kafka Connect REST API.
+Both connector configs live in [connect/](connect/) in JSONC format. The registration scripts strip comments before POSTing.
 
 Key settings:
 
-| Property | Value | Why |
+| Property | Primary (`connector.jsonc`) | DR (`connector-dr.jsonc`) |
 |---|---|---|
-| `topic.prefix` | `cdc` | Topics named `cdc.<db>.<schema>.<table>` |
-| `table.include.list` | `dbo.customers` | Schema.table format only — database is set separately in `database.names` |
-| `database.encrypt` | `false` | Docker uses a self-signed cert — JDBC rejects it by default |
-| `database.trustServerCertificate` | `true` | Required alongside `encrypt=false` |
-| `value.converter.schemas.enable` | `false` | Strips Connect schema envelope; consumer gets flat JSON |
-| `snapshot.mode` | `initial` | Snapshots all existing rows on first start |
-| `schema.history.internal.kafka.topic` | `schema-changes.CdcDemo` | DDL history replayed on connector restart to reconstruct schemas |
+| `schema.history.internal.kafka.bootstrap.servers` | `kafka:29092` | `kafka-dr:29093` |
+| `snapshot.mode` | `initial` | `initial` (skipped — offset already exists from MM2 replication) |
+| `table.include.list` | `dbo.customers` | `dbo.customers` |
+| `topic.prefix` | `cdc` | `cdc` |
+
+All other properties (SQL Server connection, converters, table filter) are identical.
 
 ---
 
 ## Useful Commands
 
-**Reset the connector** (re-runs snapshot):
+**Check connector states:**
 
 ```powershell
-Invoke-RestMethod -Method Delete -Uri 'http://localhost:8083/connectors/sqlserver-cdc-connector'
-.\scripts\register_connector.ps1
+Invoke-RestMethod http://localhost:8083/connectors/sqlserver-cdc-connector/status  # primary
+Invoke-RestMethod http://localhost:8084/connectors/sqlserver-cdc-connector/status  # DR
 ```
 
 **List topics on primary / DR:**
@@ -314,7 +279,14 @@ docker exec kafka    kafka-topics --bootstrap-server localhost:29092 --list
 docker exec kafka-dr kafka-topics --bootstrap-server localhost:29093 --list
 ```
 
-**Consume a topic raw** (useful for debugging message shape):
+**Compare end offsets (replication lag check):**
+
+```powershell
+docker exec kafka    kafka-run-class kafka.tools.GetOffsetShell --broker-list localhost:29092 --topic cdc.CdcDemo.dbo.customers --time -1
+docker exec kafka-dr kafka-run-class kafka.tools.GetOffsetShell --broker-list localhost:29093 --topic cdc.CdcDemo.dbo.customers --time -1
+```
+
+**Consume a topic raw:**
 
 ```powershell
 docker exec kafka kafka-console-consumer `
@@ -323,23 +295,25 @@ docker exec kafka kafka-console-consumer `
   --from-beginning
 ```
 
-**Check MirrorMaker 2 replication lag:**
-
-```powershell
-docker logs mirrormaker2 --tail 50
-```
-
 **Check logs:**
 
 ```powershell
-docker logs sqlserver-init   # Confirm CDC jobs started and rows seeded
-docker logs kafka-connect    # Watch for connector errors
-docker logs mirrormaker2     # Watch replication activity
+docker logs sqlserver-init    # Confirm CDC jobs started and rows seeded
+docker logs kafka-connect     # Primary connector errors
+docker logs kafka-connect-dr  # DR connector errors
+docker logs mirrormaker2      # Replication activity
+```
+
+**Reset the primary connector** (re-runs snapshot):
+
+```powershell
+Invoke-RestMethod -Method Delete -Uri 'http://localhost:8083/connectors/sqlserver-cdc-connector'
+.\scripts\register_connector.ps1
 ```
 
 **Tear down:**
 
 ```powershell
 docker compose down      # Stops containers, preserves volumes
-docker compose down -v   # Full reset including volumes (required when switching ZK → KRaft)
+docker compose down -v   # Full reset including volumes
 ```

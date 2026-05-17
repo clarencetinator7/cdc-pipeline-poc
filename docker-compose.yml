@@ -156,9 +156,9 @@ services:
     networks:
       - cdc-net
 
-  # ─── KAFKA CONNECT + DEBEZIUM ─────────────────────────────────────────────────
+  # ─── KAFKA CONNECT + DEBEZIUM (PRIMARY) ──────────────────────────────────────
+  # Writes CDC events to the primary Kafka cluster.
   # quay.io/debezium/connect ships all Debezium connectors pre-installed.
-  # Waits for kafka (healthy) AND sqlserver-init (completed) before starting.
   kafka-connect:
     image: quay.io/debezium/connect:3.0.0.Final
     container_name: kafka-connect
@@ -169,10 +169,7 @@ services:
       sqlserver-init:
         condition: service_completed_successfully
     environment:
-      # Set KAFKA_CONNECT_BOOTSTRAP on the host before running docker compose to switch clusters.
-      # Normal:   $env:KAFKA_CONNECT_BOOTSTRAP = "kafka:29092"  (or unset — default below)
-      # Failover: $env:KAFKA_CONNECT_BOOTSTRAP = "kafka-dr:29093"
-      BOOTSTRAP_SERVERS: "${KAFKA_CONNECT_BOOTSTRAP:-kafka:29092}"
+      BOOTSTRAP_SERVERS: "kafka:29092"
       GROUP_ID: "cdc-connect-group"
       CONFIG_STORAGE_TOPIC: "connect-configs"
       OFFSET_STORAGE_TOPIC: "connect-offsets"
@@ -187,6 +184,45 @@ services:
       VALUE_CONVERTER_SCHEMAS_ENABLE: "false"
     ports:
       - "8083:8083"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8083/connectors"]
+      interval: 15s
+      timeout: 10s
+      retries: 15
+      start_period: 45s
+    networks:
+      - cdc-net
+
+  # ─── KAFKA CONNECT + DEBEZIUM (DR) ────────────────────────────────────────────
+  # Writes CDC events to the DR Kafka cluster.
+  # The Debezium connector registered here is kept PAUSED during normal operation.
+  # On failover: resume the connector — it reads the replicated LSN from
+  # connect-offsets (synced by MM2) and resumes CDC without a snapshot.
+  # Port 8084 on the host maps to the same 8083 inside the container.
+  kafka-connect-dr:
+    image: quay.io/debezium/connect:3.0.0.Final
+    container_name: kafka-connect-dr
+    hostname: kafka-connect-dr
+    depends_on:
+      kafka-dr:
+        condition: service_healthy
+      sqlserver-init:
+        condition: service_completed_successfully
+    environment:
+      BOOTSTRAP_SERVERS: "kafka-dr:29093"
+      GROUP_ID: "cdc-connect-dr-group"
+      CONFIG_STORAGE_TOPIC: "connect-configs"
+      OFFSET_STORAGE_TOPIC: "connect-offsets"
+      STATUS_STORAGE_TOPIC: "connect-status"
+      CONFIG_STORAGE_REPLICATION_FACTOR: 1
+      OFFSET_STORAGE_REPLICATION_FACTOR: 1
+      STATUS_STORAGE_REPLICATION_FACTOR: 1
+      KEY_CONVERTER: "org.apache.kafka.connect.json.JsonConverter"
+      VALUE_CONVERTER: "org.apache.kafka.connect.json.JsonConverter"
+      KEY_CONVERTER_SCHEMAS_ENABLE: "false"
+      VALUE_CONVERTER_SCHEMAS_ENABLE: "false"
+    ports:
+      - "8084:8083"
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8083/connectors"]
       interval: 15s

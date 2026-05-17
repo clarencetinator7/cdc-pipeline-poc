@@ -1,0 +1,52 @@
+{
+  // DR connector — identical to connector.jsonc with one change:
+  // schema.history.internal.kafka.bootstrap.servers points at kafka-dr instead of kafka.
+  //
+  // This connector is registered on kafka-connect-dr (port 8084) and kept PAUSED
+  // during normal operation. On failover, resume it via:
+  //   Invoke-RestMethod -Method Put http://localhost:8084/connectors/sqlserver-cdc-connector/resume
+  //
+  // Because MM2 replicates connect-offsets primary→DR, the connector finds the
+  // primary Debezium's last LSN here and resumes from that position — no snapshot.
+  "name": "sqlserver-cdc-connector",
+
+  "config": {
+    "connector.class": "io.debezium.connector.sqlserver.SqlServerConnector",
+    "tasks.max": "1",
+
+    // ── TOPIC NAMING ────────────────────────────────────────────────────────────
+    "topic.prefix": "cdc",
+
+    // ── DATABASE CONNECTION ──────────────────────────────────────────────────────
+    "database.hostname": "sqlserver",
+    "database.port": "1433",
+    "database.user": "sa",
+    "database.password": "YourStrong!Passw0rd",
+    "database.names": "CdcDemo",
+    "database.encrypt": "false",
+    "database.trustServerCertificate": "true",
+
+    // ── WHAT TO CAPTURE ─────────────────────────────────────────────────────────
+    "table.include.list": "dbo.customers",
+
+    // ── SCHEMA HISTORY ──────────────────────────────────────────────────────────
+    // Points at the DR Kafka cluster — MM2 replicates schema-changes.CdcDemo here,
+    // so Debezium can reconstruct schemas from the DR copy on restart.
+    "schema.history.internal.kafka.bootstrap.servers": "kafka-dr:29093",
+    "schema.history.internal.kafka.topic": "schema-changes.CdcDemo",
+
+    // ── SERIALIZATION ───────────────────────────────────────────────────────────
+    "key.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "key.converter.schemas.enable": "false",
+    "value.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "value.converter.schemas.enable": "false",
+
+    "include.schema.changes": "true",
+
+    // ── SNAPSHOT MODE ───────────────────────────────────────────────────────────
+    // "initial" would snapshot on first start if no offset exists.
+    // In practice this connector will find the replicated offset from the primary
+    // in connect-offsets (synced by MM2) and skip the snapshot entirely.
+    "snapshot.mode": "initial"
+  }
+}
