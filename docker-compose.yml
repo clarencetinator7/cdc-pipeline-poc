@@ -133,7 +133,7 @@ services:
   # MirrorMaker 2 (MM2) is Kafka's built-in cluster replication tool.
   # AWS MSK Replication is managed MM2 under the hood.
   # Runs in standalone mode: reads mm2.properties, starts all three mirror connectors:
-  #   MirrorSourceConnector     — copies messages primary → DR (topic prefix: "primary.")
+  #   MirrorSourceConnector     — copies messages primary → DR (same topic name, IdentityReplicationPolicy)
   #   MirrorCheckpointConnector — syncs consumer group offsets to DR for failover
   #   MirrorHeartbeatConnector  — emits heartbeats to verify connectivity
   mirrormaker2:
@@ -169,7 +169,10 @@ services:
       sqlserver-init:
         condition: service_completed_successfully
     environment:
-      BOOTSTRAP_SERVERS: "kafka:29092"
+      # Set KAFKA_CONNECT_BOOTSTRAP on the host before running docker compose to switch clusters.
+      # Normal:   $env:KAFKA_CONNECT_BOOTSTRAP = "kafka:29092"  (or unset — default below)
+      # Failover: $env:KAFKA_CONNECT_BOOTSTRAP = "kafka-dr:29093"
+      BOOTSTRAP_SERVERS: "${KAFKA_CONNECT_BOOTSTRAP:-kafka:29092}"
       GROUP_ID: "cdc-connect-group"
       CONFIG_STORAGE_TOPIC: "connect-configs"
       OFFSET_STORAGE_TOPIC: "connect-offsets"

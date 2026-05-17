@@ -26,11 +26,11 @@ from confluent_kafka import Consumer, KafkaError, KafkaException
 # Read from env vars so you can switch clusters without editing code.
 # On failover:
 #   $env:KAFKA_BOOTSTRAP_SERVERS = "localhost:9093"
-#   $env:KAFKA_TOPIC = "primary.cdc.CdcDemo.dbo.customers"
+#   $env:KAFKA_TOPIC = "cdc.CdcDemo.dbo.customers"
 KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
 TOPIC = os.getenv("KAFKA_TOPIC", "cdc.CdcDemo.dbo.customers")
 # KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9093")
-# TOPIC = os.getenv("KAFKA_TOPIC", "primary.cdc.CdcDemo.dbo.customers")
+# TOPIC = os.getenv("KAFKA_TOPIC", "cdc.CdcDemo.dbo.customers")
 
 CONSUMER_CONFIG = {
     "bootstrap.servers": KAFKA_BOOTSTRAP_SERVERS,
