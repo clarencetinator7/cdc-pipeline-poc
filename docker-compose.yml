@@ -56,47 +56,32 @@ services:
       - cdc-net
     restart: "no"
 
-  # ─── ZOOKEEPER ───────────────────────────────────────────────────────────────
-  zookeeper:
-    image: confluentinc/cp-zookeeper:7.6.1
-    container_name: zookeeper
-    hostname: zookeeper
-    environment:
-      ZOOKEEPER_CLIENT_PORT: 2181
-      ZOOKEEPER_TICK_TIME: 2000
-    ports:
-      - "2181:2181"
-    healthcheck:
-      test: ["CMD-SHELL", "echo srvr | nc -w 2 localhost 2181 | grep -q Mode"]
-      interval: 10s
-      timeout: 5s
-      retries: 10
-    networks:
-      - cdc-net
-
-  # ─── KAFKA ───────────────────────────────────────────────────────────────────
+  # ─── PRIMARY KAFKA (KRaft) ────────────────────────────────────────────────────
+  # KRaft = Kafka Raft: the broker is its own controller — no ZooKeeper needed.
+  # CLUSTER_ID must be a unique 22-char URL-safe base64 UUID per cluster.
   # Two listeners:
   #   PLAINTEXT      → container-to-container (kafka:29092)
-  #   PLAINTEXT_HOST → host machine access   (localhost:9092)
+  #   PLAINTEXT_HOST → host machine access    (localhost:9092)
+  #   CONTROLLER     → KRaft controller port  (kafka:9094, internal only)
   kafka:
     image: confluentinc/cp-kafka:7.6.1
     container_name: kafka
     hostname: kafka
-    depends_on:
-      zookeeper:
-        condition: service_healthy
     environment:
-      KAFKA_BROKER_ID: 1
-      KAFKA_ZOOKEEPER_CONNECT: "zookeeper:2181"
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT"
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: "1@kafka:9094"
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT"
+      KAFKA_LISTENERS: "PLAINTEXT://0.0.0.0:29092,PLAINTEXT_HOST://0.0.0.0:9092,CONTROLLER://0.0.0.0:9094"
       KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092"
-      KAFKA_LISTENERS: "PLAINTEXT://0.0.0.0:29092,PLAINTEXT_HOST://0.0.0.0:9092"
-      KAFKA_INTER_BROKER_LISTENER_NAME: "PLAINTEXT"
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
       KAFKA_LOG_RETENTION_HOURS: 168
+      CLUSTER_ID: "MkU3OEVBNTcwNTJENDM2Qk"
     ports:
       - "9092:9092"
       - "29092:29092"
@@ -109,7 +94,69 @@ services:
     networks:
       - cdc-net
 
-# ─── KAFKA CONNECT + DEBEZIUM ─────────────────────────────────────────────────
+  # ─── DR KAFKA (KRaft) ─────────────────────────────────────────────────────────
+  # Standalone DR cluster — completely independent from the primary.
+  # MirrorMaker 2 replicates topic data and checkpoints consumer offsets here.
+  # CONTROLLER port 9095 avoids collision with primary's 9094.
+  kafka-dr:
+    image: confluentinc/cp-kafka:7.6.1
+    container_name: kafka-dr
+    hostname: kafka-dr
+    environment:
+      KAFKA_NODE_ID: 2
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: "2@kafka-dr:9095"
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT"
+      KAFKA_LISTENERS: "PLAINTEXT://0.0.0.0:29093,PLAINTEXT_HOST://0.0.0.0:9093,CONTROLLER://0.0.0.0:9095"
+      KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://kafka-dr:29093,PLAINTEXT_HOST://localhost:9093"
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_LOG_RETENTION_HOURS: 168
+      CLUSTER_ID: "RHU3OEVBNTcwNTJENDM2Rg"
+    ports:
+      - "9093:9093"
+      - "29093:29093"
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:29093"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    networks:
+      - cdc-net
+
+  # ─── MIRRORMAKER 2 ────────────────────────────────────────────────────────────
+  # MirrorMaker 2 (MM2) is Kafka's built-in cluster replication tool.
+  # AWS MSK Replication is managed MM2 under the hood.
+  # Runs in standalone mode: reads mm2.properties, starts all three mirror connectors:
+  #   MirrorSourceConnector     — copies messages primary → DR (topic prefix: "primary.")
+  #   MirrorCheckpointConnector — syncs consumer group offsets to DR for failover
+  #   MirrorHeartbeatConnector  — emits heartbeats to verify connectivity
+  mirrormaker2:
+    image: confluentinc/cp-kafka:7.6.1
+    container_name: mirrormaker2
+    hostname: mirrormaker2
+    depends_on:
+      kafka:
+        condition: service_healthy
+      kafka-dr:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "-c"]
+    command: ["/usr/bin/connect-mirror-maker /etc/mm2/mm2.properties"]
+    environment:
+      # connect-mirror-maker resolves log4j config relative to /usr/bin/../config/,
+      # which doesn't exist. Override to the actual path in the Confluent image.
+      KAFKA_LOG4J_OPTS: "-Dlog4j.configuration=file:/etc/kafka/connect-log4j.properties"
+    volumes:
+      - ./connect/mm2.properties:/etc/mm2/mm2.properties:ro
+    networks:
+      - cdc-net
+
+  # ─── KAFKA CONNECT + DEBEZIUM ─────────────────────────────────────────────────
   # quay.io/debezium/connect ships all Debezium connectors pre-installed.
   # Waits for kafka (healthy) AND sqlserver-init (completed) before starting.
   kafka-connect:

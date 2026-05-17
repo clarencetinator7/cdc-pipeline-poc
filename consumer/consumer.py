@@ -17,13 +17,20 @@ Run:
 """
 
 import json
+import os
 import signal
 from datetime import datetime, timezone
 
 from confluent_kafka import Consumer, KafkaError, KafkaException
 
-KAFKA_BOOTSTRAP_SERVERS = "localhost:9092"
-TOPIC = "cdc.CdcDemo.dbo.customers"
+# Read from env vars so you can switch clusters without editing code.
+# On failover:
+#   $env:KAFKA_BOOTSTRAP_SERVERS = "localhost:9093"
+#   $env:KAFKA_TOPIC = "primary.cdc.CdcDemo.dbo.customers"
+KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
+TOPIC = os.getenv("KAFKA_TOPIC", "cdc.CdcDemo.dbo.customers")
+# KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9093")
+# TOPIC = os.getenv("KAFKA_TOPIC", "primary.cdc.CdcDemo.dbo.customers")
 
 CONSUMER_CONFIG = {
     "bootstrap.servers": KAFKA_BOOTSTRAP_SERVERS,
@@ -31,7 +38,7 @@ CONSUMER_CONFIG = {
     # `Offset` is the position of a consumer in a partition, and it indicates which messages have been consumed.
     # enable.auto.commit - every messages you read gets its offset committed to Kafka,
     # so when you restart the consumer, it will start from the last committed offset.
-    "enable.auto.commit": False, 
+    "enable.auto.commit": True, 
     # auto.offset.reset - controls where to start reading when there is no committed offset for the group.
     # "earliest" - start from the very first message in the topic (replays all events on every restart when auto-commit is off).
     # "latest"   - start from new messages only, ignore everything published before the consumer started.
