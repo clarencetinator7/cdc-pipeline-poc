@@ -1,0 +1,97 @@
+# mirrormaker2-deployment.yaml
+#
+# Deploys MirrorMaker 2 as a single-replica Deployment.
+# MM2 is stateless — all state lives in Kafka topics — so a single pod is fine.
+# For higher throughput, increase tasks via mm2.properties, not replicas
+# (multiple MM2 pods replicating the same topics causes duplicate processing).
+#
+# How credentials work:
+#   1. The Secret (mirrormaker2-sasl-credentials) is injected as env vars.
+#   2. An init container runs envsubst to substitute ${VAR} in the ConfigMap
+#      template, writing the final mm2.properties to a shared emptyDir volume.
+#   3. The main container runs connect-mirror-maker against that file.
+#
+# Apply (after the Secret and ConfigMap):
+#   kubectl apply -f k8s/mirrormaker2-deployment.yaml -n <your-namespace>
+#
+# Check status:
+#   kubectl logs -f deployment/mirrormaker2 -n kafka
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mirrormaker2
+  namespace: kafka
+  labels:
+    app: mirrormaker2
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mirrormaker2
+  template:
+    metadata:
+      labels:
+        app: mirrormaker2
+    spec:
+      containers:
+        - name: mirrormaker2
+          # Build this image from k8s/Dockerfile and push to your JFrog registry.
+          image: your-jfrog-registry.example.com/kafka/mirrormaker2:7.6.1
+          command: ["/bin/bash", "-c"]
+          args:
+            # envsubst substitutes ${VAR} placeholders in the ConfigMap template
+            # with values from the env vars injected below (from the Secret).
+            # The resolved file is written to /tmp and MM2 reads it from there.
+            - |
+              envsubst < /config-template/mm2.properties.template > /tmp/mm2.properties
+              exec /usr/bin/connect-mirror-maker /tmp/mm2.properties
+          env:
+            - name: EU_WEST_1_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: mirrormaker2-sasl-credentials
+                  key: EU_WEST_1_USERNAME
+            - name: EU_WEST_1_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: mirrormaker2-sasl-credentials
+                  key: EU_WEST_1_PASSWORD
+            - name: EU_WEST_2_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: mirrormaker2-sasl-credentials
+                  key: EU_WEST_2_USERNAME
+            - name: EU_WEST_2_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: mirrormaker2-sasl-credentials
+                  key: EU_WEST_2_PASSWORD
+          volumeMounts:
+            - name: config-template
+              mountPath: /config-template
+          resources:
+            requests:
+              memory: "512Mi"
+              cpu: "250m"
+            limits:
+              memory: "1Gi"
+              cpu: "500m"
+          # MM2 has no HTTP endpoint — liveness is based on process staying alive.
+          # For a production-grade liveness probe, consider exposing JMX metrics.
+          livenessProbe:
+            exec:
+              command: ["pgrep", "-f", "MirrorMaker"]
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            failureThreshold: 3
+
+      volumes:
+        - name: config-template
+          configMap:
+            name: mirrormaker2-config
+
+      # Use the same service account as your Debezium Connect if it has the
+      # necessary IAM permissions, or create a dedicated one.
+      # serviceAccountName: kafka-connect-sa
+
+      restartPolicy: Always

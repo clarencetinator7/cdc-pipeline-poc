@@ -1,0 +1,93 @@
+# mirrormaker2-configmap.yaml
+# MirrorMaker 2 configuration for replicating primary MSK (eu-west-1) → DR MSK (eu-west-2).
+#
+# This file uses ${VAR} placeholders for SASL credentials.
+# The Deployment's init container runs envsubst to substitute them from the Secret
+# before starting MM2 — credentials never appear in plain text in the ConfigMap.
+#
+# Before applying:
+#   1. Replace the bootstrap.servers values with your actual MSK broker addresses.
+#      Find them in the AWS Console → MSK → your cluster → "View client information".
+#      Use the SASL/SCRAM endpoint (port 9096).
+#   2. Update topic/group filters to match your actual topic names.
+#
+# Apply:
+#   kubectl apply -f k8s/mirrormaker2-configmap.yaml -n <your-namespace>
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mirrormaker2-config
+  namespace: kafka
+data:
+  mm2.properties.template: |
+    # ── CLUSTER ALIASES ─────────────────────────────────────────────────────────
+    clusters = eu-west-1, eu-west-2
+
+    # ── CLUSTER ENDPOINTS ────────────────────────────────────────────────────────
+    # Replace with your actual MSK broker addresses (SASL/SCRAM endpoint, port 9096).
+    # You need all brokers listed — find them in AWS Console → MSK → Client information.
+    eu-west-1.bootstrap.servers = b-1.REPLACE.eu-west-1.kafka.amazonaws.com:9096,b-2.REPLACE.eu-west-1.kafka.amazonaws.com:9096
+    eu-west-2.bootstrap.servers = b-1.REPLACE.eu-west-2.kafka.amazonaws.com:9096,b-2.REPLACE.eu-west-2.kafka.amazonaws.com:9096
+
+    # ── SECURITY (SASL/SCRAM over TLS) ──────────────────────────────────────────
+    # MSK uses SASL_SSL: TLS for transport + SCRAM-SHA-512 for authentication.
+    # ${VAR} placeholders are filled by envsubst in the init container from the Secret.
+    eu-west-1.security.protocol = SASL_SSL
+    eu-west-1.sasl.mechanism = SCRAM-SHA-512
+    eu-west-1.sasl.jaas.config = org.apache.kafka.common.security.scram.ScramLoginModule required username="${EU_WEST_1_USERNAME}" password="${EU_WEST_1_PASSWORD}";
+
+    eu-west-2.security.protocol = SASL_SSL
+    eu-west-2.sasl.mechanism = SCRAM-SHA-512
+    eu-west-2.sasl.jaas.config = org.apache.kafka.common.security.scram.ScramLoginModule required username="${EU_WEST_2_USERNAME}" password="${EU_WEST_2_PASSWORD}";
+
+    # ── REPLICATION DIRECTION ────────────────────────────────────────────────────
+    eu-west-1->eu-west-2.enabled = true
+
+    # ── TOPIC NAMING POLICY ──────────────────────────────────────────────────────
+    # IdentityReplicationPolicy: topics keep original names on the DR cluster.
+    # Remove this line to use the default policy, which prefixes topics with the
+    # source alias (e.g. "eu-west-1.your-topic"). Default is safer if you ever
+    # run bidirectional replication — identical names can cause confusion.
+    replication.policy.class = org.apache.kafka.connect.mirror.IdentityReplicationPolicy
+
+    # ── WHAT TO REPLICATE ────────────────────────────────────────────────────────
+    # Adjust the regex to match your actual CDC topic names.
+    # Examples:
+    #   cdc\..*                        — all topics starting with "cdc."
+    #   cdc\.MyDb\.dbo\..*             — all tables in MyDb
+    #   cdc\.MyDb\.dbo\.customers      — specific table only
+    eu-west-1->eu-west-2.topics = cdc\..*
+
+    # Sync committed offsets for your consumer groups so they can resume on DR.
+    # Replace with your actual consumer group ID(s), comma-separated.
+    eu-west-1->eu-west-2.groups = your-consumer-group-id
+
+    # Also replicate Debezium's internal topics so it can resume from the correct
+    # LSN after a failover without re-snapshotting.
+    # Adjust connect-offsets / schema-changes topic names if yours differ.
+    # eu-west-1->eu-west-2.topics = cdc\..*|connect-offsets|schema-changes\..*
+
+    # ── OFFSET CHECKPOINTING ─────────────────────────────────────────────────────
+    eu-west-1->eu-west-2.emit.checkpoints.enabled = true
+    eu-west-1->eu-west-2.emit.checkpoints.interval.seconds = 10
+    eu-west-1->eu-west-2.sync.group.offsets.enabled = true
+    eu-west-1->eu-west-2.sync.group.offsets.interval.seconds = 10
+
+    # ── HEARTBEATS ───────────────────────────────────────────────────────────────
+    eu-west-1->eu-west-2.emit.heartbeats.enabled = true
+    eu-west-1->eu-west-2.emit.heartbeats.interval.seconds = 5
+
+    # ── INTERNAL TOPIC REPLICATION ────────────────────────────────────────────────
+    # MSK clusters typically have 3 brokers — replication.factor = 3 is standard.
+    # Lower only if your MSK cluster has fewer brokers.
+    replication.factor = 3
+    checkpoints.topic.replication.factor = 3
+    heartbeats.topic.replication.factor = 3
+    offset-syncs.topic.replication.factor = 3
+
+    eu-west-1.offset.storage.replication.factor = 3
+    eu-west-1.config.storage.replication.factor = 3
+    eu-west-1.status.storage.replication.factor = 3
+    eu-west-2.offset.storage.replication.factor = 3
+    eu-west-2.config.storage.replication.factor = 3
+    eu-west-2.status.storage.replication.factor = 3
